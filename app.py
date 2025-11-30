@@ -1,20 +1,19 @@
 """
-Clinical RAG System - Streamlit Cloud Version
-Optimized for Streamlit Community Cloud Deployment
+Clinical RAG System - Streamlit Version
+Run with: streamlit run app.py
 """
 
 import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from sentence_transformers import SentenceTransformer
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import BaseRetriever, Document
 from typing import List
-import os
+import re
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -41,6 +40,13 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
+    .source-box {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+        margin: 0.5rem 0;
+    }
     .answer-box {
         background-color: #e8f4f8;
         padding: 1.5rem;
@@ -62,25 +68,27 @@ st.markdown("""
 # LOAD MODELS (with caching)
 # =============================================================================
 
-@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner=False)
 def load_embeddings():
     """Load embedding model"""
-    return HuggingFaceEmbeddings(
+    embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={'device': 'cpu'},
         encode_kwargs={'normalize_embeddings': True}
     )
+    return embeddings
 
-@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner=False)
 def load_vectorstore(_embeddings):
     """Load FAISS vector store"""
-    return FAISS.load_local(
+    vectorstore = FAISS.load_local(
         "vectorstore", 
         _embeddings,
         allow_dangerous_deserialization=True
     )
+    return vectorstore
 
-@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner=False)
 def load_llm():
     """Load language model"""
     MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -106,14 +114,15 @@ def load_llm():
         do_sample=True
     )
     
-    return HuggingFacePipeline(pipeline=pipe)
+    llm = HuggingFacePipeline(pipeline=pipe)
+    return llm
 
 # =============================================================================
 # CUSTOM RETRIEVER
 # =============================================================================
 
 class WorkingRetriever(BaseRetriever):
-    """Custom retriever"""
+    """Custom retriever for clinical notes"""
     vectorstore: object
     k: int = 5
 
@@ -131,25 +140,42 @@ class WorkingRetriever(BaseRetriever):
 # =============================================================================
 
 def clean_llm_response(raw_answer):
-    """Clean LLM response"""
+    """Remove prompt artifacts and extract clean answer"""
     answer = raw_answer.strip()
-    remove_phrases = ["You are a clinical assistant", "Use ONLY the context below to answer",
-                      "CONTEXT:", "QUESTION:", "ANSWER:", "Direct Answer:", "NOTE_ID:"]
+    
+    remove_phrases = [
+        "You are a clinical assistant",
+        "Use ONLY the context below to answer",
+        "CONTEXT:", "QUESTION:", "ANSWER:", "Direct Answer:", "NOTE_ID:"
+    ]
+    
     for phrase in remove_phrases:
         if phrase in answer:
             parts = answer.split(phrase)
             if len(parts) > 1:
                 answer = parts[-1].strip()
     
+    if "CHIEF COMPLAINT:" in answer and len(answer) > 100:
+        if answer.index("CHIEF COMPLAINT:") > 100:
+            answer = answer.split("CHIEF COMPLAINT:")[0].strip()
+    
     lines = answer.split('\n')
     clean_lines = [line for line in lines if not line.strip().startswith('NOTE_ID:')]
-    return '\n'.join(clean_lines).strip()
+    answer = '\n'.join(clean_lines).strip()
+    
+    sentences = answer.split('.')
+    if len(sentences) > 0 and len(answer) > 500:
+        answer = sentences[0].strip() + '.'
+    
+    return answer
 
 def format_source_document(doc, index):
-    """Format source document"""
+    """Format a single source document"""
     note_id = doc.metadata.get('note_id', 'N/A')
     doc_type = doc.metadata.get('type', 'unknown')
     diagnosis = doc.metadata.get('diagnosis', 'N/A')
+    chunk_idx = doc.metadata.get('chunk_index', 'N/A')
+    
     content_preview = doc.page_content[:300].replace('\n', ' ')
     
     return f"""
@@ -157,26 +183,33 @@ def format_source_document(doc, index):
 - **Type:** {doc_type}
 - **Note ID:** {note_id}
 - **Diagnosis:** {diagnosis}
+- **Chunk:** {chunk_idx}
 
-**Preview:** {content_preview}...
+**Preview:**  
+{content_preview}...
 """
 
 # =============================================================================
-# INITIALIZE SYSTEM
+# INITIALIZE COMPONENTS
 # =============================================================================
 
 def initialize_system():
-    """Initialize all components"""
+    """Initialize all system components"""
     if 'initialized' not in st.session_state:
-        with st.spinner("🔄 Loading RAG system..."):
+        with st.spinner("🔄 Loading RAG system components..."):
+            # Load components
             st.session_state.embeddings = load_embeddings()
             st.session_state.vectorstore = load_vectorstore(st.session_state.embeddings)
             st.session_state.llm = load_llm()
+            
+            # Create retriever
             st.session_state.retriever = WorkingRetriever(
-                vectorstore=st.session_state.vectorstore, k=5
+                vectorstore=st.session_state.vectorstore,
+                k=5
             )
             
-            PROMPT = """You are a clinical assistant. Use ONLY the context below to answer.
+            # Create QA chain
+            CLEAN_PROMPT = """You are a clinical assistant. Use ONLY the context below to answer.
 
 CONTEXT:
 {context}
@@ -185,7 +218,10 @@ QUESTION: {question}
 
 ANSWER:"""
             
-            prompt = PromptTemplate(template=PROMPT, input_variables=["context", "question"])
+            prompt = PromptTemplate(
+                template=CLEAN_PROMPT,
+                input_variables=["context", "question"]
+            )
             
             st.session_state.qa_chain = RetrievalQA.from_chain_type(
                 llm=st.session_state.llm,
@@ -196,43 +232,76 @@ ANSWER:"""
             )
             
             st.session_state.initialized = True
+            st.success("✅ System loaded successfully!")
 
 # =============================================================================
 # MAIN APP
 # =============================================================================
 
 def main():
+    # Header
     st.markdown('<h1 class="main-header">🏥 Clinical RAG System</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Medical Note Analysis & Knowledge Retrieval</p>', unsafe_allow_html=True)
     
+    # Initialize system
     initialize_system()
     
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        num_sources = st.slider("Number of Source Documents", 1, 10, 5)
+        
+        num_sources = st.slider(
+            "Number of Source Documents",
+            min_value=1,
+            max_value=10,
+            value=5,
+            help="Number of relevant documents to retrieve"
+        )
+        
         st.session_state.retriever.k = num_sources
         
         st.divider()
+        
+        st.header("📊 System Info")
+        if st.button("Show Statistics"):
+            st.session_state.show_stats = True
+        
+        st.divider()
+        
         st.header("💡 Example Queries")
         st.markdown("""
+        **Patient-Specific:**
         - What is the chief complaint for patient 18427803-DS-5?
+        - What are the clinical findings for patient X?
+        
+        **Diagnosis-Related:**
         - What are the features of migraine with aura?
         - Key symptoms of stroke?
+        
+        **Treatment:**
+        - What is the treatment plan for patient Y?
         """)
+        
         st.divider()
+        
+        st.markdown("**Data Source:** MIMIC-IV Clinical Notes")
         st.markdown(f"**Vectors:** {st.session_state.vectorstore.index.ntotal:,}")
     
-    # Main tabs
-    tab1, tab2, tab3 = st.tabs(["💬 Query System", "👤 Patient Lookup", "📊 Info"])
+    # Main content tabs
+    tab1, tab2, tab3 = st.tabs(["💬 Query System", "👤 Patient Lookup", "📊 System Stats"])
     
     # TAB 1: General Query
     with tab1:
         st.header("Ask a Clinical Question")
-        query = st.text_area("Your Query:", height=100, 
-                            placeholder="E.g., What is the chief complaint for patient 18427803-DS-5?")
         
-        col1, col2 = st.columns([1, 5])
+        # Query input
+        query = st.text_area(
+            "Your Query:",
+            height=100,
+            placeholder="E.g., What is the chief complaint for patient 18427803-DS-5?"
+        )
+        
+        col1, col2, col3 = st.columns([1, 1, 4])
         with col1:
             search_button = st.button("🔍 Search", type="primary", use_container_width=True)
         with col2:
@@ -242,48 +311,62 @@ def main():
             st.rerun()
         
         if search_button and query:
-            with st.spinner("🔄 Processing..."):
+            with st.spinner("🔄 Processing your query..."):
                 try:
+                    # Get results
                     result = st.session_state.qa_chain.invoke({"query": query})
-                    clean_answer = clean_llm_response(result["result"])
                     
+                    # Clean answer
+                    raw_answer = result["result"]
+                    clean_answer = clean_llm_response(raw_answer)
+                    
+                    # Display answer
                     st.markdown("### 📝 Answer")
                     st.markdown(f'<div class="answer-box">{clean_answer}</div>', unsafe_allow_html=True)
                     
+                    # Display metadata
                     sources = result["source_documents"]
                     note_ids = list(set([doc.metadata.get('note_id', 'N/A') for doc in sources]))
                     
                     st.markdown("### 📊 Query Metadata")
                     metadata_html = f"""
                     <div class="metadata-box">
-                    <strong>Retrieved:</strong> {len(sources)} documents<br>
-                    <strong>Note IDs:</strong> {', '.join(note_ids[:3])}{'...' if len(note_ids) > 3 else ''}
+                    <strong>Retrieved Documents:</strong> {len(sources)}<br>
+                    <strong>Note IDs Found:</strong> {', '.join(note_ids[:3])}{'...' if len(note_ids) > 3 else ''}<br>
+                    <strong>Query Length:</strong> {len(query)} characters
                     </div>
                     """
                     st.markdown(metadata_html, unsafe_allow_html=True)
                     
+                    # Display sources
                     st.markdown("### 📚 Source Documents")
+                    
                     for i, doc in enumerate(sources, 1):
                         with st.expander(f"Source {i}: {doc.metadata.get('note_id', 'N/A')}"):
                             st.markdown(format_source_document(doc, i))
-                
+                    
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
         
-        elif search_button:
-            st.warning("⚠️ Please enter a query!")
+        elif search_button and not query:
+            st.warning("⚠️ Please enter a query first!")
     
     # TAB 2: Patient Lookup
     with tab2:
         st.header("Patient-Specific Information")
-        patient_id = st.text_input("Enter Patient Note ID:", placeholder="E.g., 18427803-DS-5")
+        
+        patient_id = st.text_input(
+            "Enter Patient Note ID:",
+            placeholder="E.g., 18427803-DS-5"
+        )
         
         if st.button("📋 Get Patient Summary", type="primary"):
             if patient_id:
-                with st.spinner(f"🔄 Retrieving info for {patient_id}..."):
+                with st.spinner(f"🔄 Retrieving information for patient {patient_id}..."):
                     try:
                         query = f"Provide a comprehensive clinical summary for patient {patient_id}"
                         result = st.session_state.qa_chain.invoke({"query": query})
+                        
                         clean_answer = clean_llm_response(result["result"])
                         
                         st.markdown("### 📝 Patient Summary")
@@ -293,28 +376,53 @@ def main():
                         for i, doc in enumerate(result["source_documents"], 1):
                             with st.expander(f"Source {i}"):
                                 st.markdown(format_source_document(doc, i))
+                    
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")
             else:
                 st.warning("⚠️ Please enter a patient ID!")
     
-    # TAB 3: System Info
+    # TAB 3: System Statistics
     with tab3:
-        st.header("System Information")
+        st.header("System Statistics & Information")
+        
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("📊 Vector Store")
             st.metric("Total Vectors", f"{st.session_state.vectorstore.index.ntotal:,}")
             st.metric("Embedding Model", "all-MiniLM-L6-v2")
+            st.metric("Embedding Dimension", "384")
         
         with col2:
             st.subheader("🤖 Language Model")
             st.metric("Model", "TinyLlama-1.1B-Chat")
             st.metric("Max Tokens", "256")
+            st.metric("Temperature", "0.7")
         
         st.divider()
-        st.info("**Data:** MIMIC-IV Clinical Notes + Knowledge Graphs")
+        
+        st.subheader("📂 Data Sources")
+        st.info("""
+        **Clinical Notes:** MIMIC-IV DiReCT dataset  
+        **Knowledge Graphs:** Diagnostic reasoning knowledge bases  
+        **Processing:** LangChain + FAISS vector store
+        """)
+        
+        st.divider()
+        
+        st.subheader("🔧 System Capabilities")
+        st.markdown("""
+        - ✅ Patient-specific information retrieval
+        - ✅ Diagnosis-related queries
+        - ✅ Treatment plan analysis
+        - ✅ Clinical reasoning support
+        - ✅ Multi-source grounding
+        """)
+
+# =============================================================================
+# RUN APP
+# =============================================================================
 
 if __name__ == "__main__":
     main()
