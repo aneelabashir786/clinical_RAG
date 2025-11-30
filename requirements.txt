@@ -8,10 +8,3 @@ langchain-core==0.3.23
 langchain-huggingface==0.1.2
 faiss-cpu==1.9.0.post1
 accelerate==1.2.1
-```
-
-## Alternative: Force Python 3.11
-
-If you want to keep your exact package versions, create a `.python-version` file in your repo:
-```
-3.11
