@@ -4,7 +4,7 @@ transformers==4.46.3
 sentence-transformers==3.3.1
 langchain==0.3.13
 langchain-community==0.3.13
-langchain-core==0.3.26
+langchain-core==0.3.27
 langchain-huggingface==0.1.2
 faiss-cpu==1.9.0.post1
 accelerate==1.2.1
