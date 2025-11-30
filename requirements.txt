@@ -1,10 +1,22 @@
 streamlit==1.29.0
-torch==2.1.0
+
+# PyTorch (Python 3.13-compatible)
+torch==2.7.0
+torchvision==0.18.0
+torchaudio==2.7.0
+
+# Transformers + Sentence Embeddings
 transformers==4.36.0
 sentence-transformers==2.2.2
+
+# LangChain ecosystem (compatible)
 langchain==0.1.20
 langchain-community==0.0.38
 langchain-core==0.1.52
 langchain-huggingface==0.0.1
+
+# Vector Database
 faiss-cpu==1.7.4
+
+# Optimization
 accelerate==0.25.0
